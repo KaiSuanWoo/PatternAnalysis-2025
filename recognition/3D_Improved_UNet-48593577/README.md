@@ -1,4 +1,4 @@
-# <Project Title>: <Model> on <Dataset> for <Task>
+# <Project Prostate 3D Segmentation with Improved 3D U-Net (Hard Difficulty)>: <Model> on <Dataset> for <Task>
 
 ## Problem & Goal
 Briefly define the recognition problem, dataset, labels, and the target metric(s).
