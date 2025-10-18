@@ -1,0 +1,21 @@
+# --- DATASETS ---
+/Datasets/
+/data/
+/dataset/
+/Prostate3D_data/
+/*.nii
+/*.nii.gz
+
+# --- LOGS & OUTPUTS ---
+/runs/
+/results/
+/checkpoints/
+/outputs/
+/__pycache__/
+/*.pt
+/*.pth
+/*.ckpt
+
+# --- SYSTEM FILES ---
+.DS_Store
+Thumbs.db
