@@ -52,3 +52,26 @@ def to_tensor(img: np.ndarray, msk: np.ndarray) -> Tuple[torch.Tensor, torch.Ten
 
 def save_split(paths: Dict[str, List[str]], out_path: str) -> None:
     with open(out_path, "w") as f: json.dump(paths, f, indent=2)
+
+
+# Loss & Metric Functions
+
+def dice_coefficient(pred, target, eps=1e-6):
+    """Computes Dice score for binary masks."""
+    pred = (pred > 0.5).float()
+    inter = (pred * target).sum()
+    union = pred.sum() + target.sum()
+    return (2 * inter + eps) / (union + eps)
+
+class DiceLoss(torch.nn.Module):
+    def __init__(self, smooth=1e-6):
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(self, pred, target):
+        pred = pred.contiguous()
+        target = target.contiguous()
+        inter = (pred * target).sum()
+        denom = pred.sum() + target.sum()
+        dice = (2. * inter + self.smooth) / (denom + self.smooth)
+        return 1 - dice
