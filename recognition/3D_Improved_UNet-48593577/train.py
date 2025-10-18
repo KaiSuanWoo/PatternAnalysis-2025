@@ -112,13 +112,14 @@ def main():
     scaler = torch.amp.GradScaler(device_type="cuda", enabled=use_amp) if use_amp else None
 
     best_dice = 0.0
-    for epoch in range(1, EPOCHS + 1):
+    epoch_iter = tqdm(range(1, EPOCHS + 1), desc="Epochs", unit="epoch")
+    for epoch in epoch_iter:
         t0 = time.time()
         train_loss = train_one_epoch(model, train_loader, optimizer, loss_fn, scaler, device, use_amp)
         val_dice = validate(model, val_loader, device)
         dt = time.time() - t0
 
-        print(f"[Epoch {epoch:03d}] Train Loss={train_loss:.4f} | Val Dice={val_dice:.4f} | {dt:.1f}s")
+        epoch_iter.set_postfix(train_loss=f"{train_loss:.4f}", val_dice=f"{val_dice:.4f}", time=f"{dt:.1f}s")
 
         if val_dice >= best_dice:
             best_dice = val_dice
