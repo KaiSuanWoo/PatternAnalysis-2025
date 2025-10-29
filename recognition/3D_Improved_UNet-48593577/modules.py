@@ -1,171 +1,133 @@
+# modules.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# ---- blocks ----
+class Conv3dIN(nn.Sequential):
+    def __init__(self, cin, cout, k=3, s=1, p=1):
+        super().__init__(
+            nn.Conv3d(cin, cout, k, s, p, bias=False),
+            nn.InstanceNorm3d(cout, affine=True),
+            nn.LeakyReLU(0.1, inplace=True),
+        )
 
-def conv_block(in_ch: int, out_ch: int) -> nn.Sequential:
-    """Two 3×3×3 convolutions with InstanceNorm and ReLU."""
-    return nn.Sequential(
-        nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=1),
-        nn.InstanceNorm3d(out_ch),
-        nn.ReLU(inplace=True),
-        nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1),
-        nn.InstanceNorm3d(out_ch),
-        nn.ReLU(inplace=True),
-    )
-
-
-def down_block(in_ch: int, out_ch: int) -> nn.Sequential:
-    """Max-pool followed by a conv block."""
-    return nn.Sequential(
-        nn.MaxPool3d(2),
-        conv_block(in_ch, out_ch)
-    )
-
-
-def up_block(in_ch: int, out_ch: int) -> nn.Sequential:
-    """Upsample by factor 2 with transposed conv."""
-    return nn.Sequential(
-        nn.ConvTranspose3d(in_ch, out_ch, kernel_size=2, stride=2),
-        nn.ReLU(inplace=True),
-    )
-
-
-class UNet3D(nn.Module):
-    """Baseline 3D U-Net with InstanceNorm skip connections."""
-
-    def __init__(self, in_channels: int = 1, out_channels: int = 1, base_ch: int = 32):
+class ResBlock3D(nn.Module):
+    def __init__(self, c):
         super().__init__()
-        self.enc1 = conv_block(in_channels, base_ch)
-        self.pool1 = nn.MaxPool3d(2)
-        self.enc2 = conv_block(base_ch, base_ch * 2)
-        self.pool2 = nn.MaxPool3d(2)
-        self.enc3 = conv_block(base_ch * 2, base_ch * 4)
-        self.pool3 = nn.MaxPool3d(2)
-        self.enc4 = conv_block(base_ch * 4, base_ch * 8)
-        self.pool4 = nn.MaxPool3d(2)
+        self.conv1 = Conv3dIN(c, c)
+        self.conv2 = Conv3dIN(c, c)
+    def forward(self, x):
+        return x + self.conv2(self.conv1(x))
 
-        self.bottleneck = conv_block(base_ch * 8, base_ch * 16)
+class scSE(nn.Module):
+    def __init__(self, c, r=8):
+        super().__init__()
+        self.cSE = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1),
+            nn.Conv3d(c, c // r, 1), nn.ReLU(inplace=True),
+            nn.Conv3d(c // r, c, 1), nn.Sigmoid()
+        )
+        self.sSE = nn.Sequential(nn.Conv3d(c, 1, 1), nn.Sigmoid())
+    def forward(self, x):
+        return x * self.cSE(x) + x * self.sSE(x)
 
-        self.up4 = up_block(base_ch * 16, base_ch * 8)
-        self.dec4 = conv_block(base_ch * 16, base_ch * 8)
-        self.up3 = up_block(base_ch * 8, base_ch * 4)
-        self.dec3 = conv_block(base_ch * 8, base_ch * 4)
-        self.up2 = up_block(base_ch * 4, base_ch * 2)
-        self.dec2 = conv_block(base_ch * 4, base_ch * 2)
-        self.up1 = up_block(base_ch * 2, base_ch)
-        self.dec1 = conv_block(base_ch * 2, base_ch)
-
-        self.out_conv = nn.Conv3d(base_ch, out_channels, kernel_size=1)
-
-    @staticmethod
-    def _align_skip(skip: torch.Tensor, upsampled: torch.Tensor) -> torch.Tensor:
-        """Resize skip tensor if needed to match decoder spatial dims."""
-        if skip.shape[2:] != upsampled.shape[2:]:
-            return F.interpolate(skip, size=upsampled.shape[2:], mode="trilinear", align_corners=False)
-        return skip
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool1(e1))
-        e3 = self.enc3(self.pool2(e2))
-        e4 = self.enc4(self.pool3(e3))
-        b = self.bottleneck(self.pool4(e4))
-
-        d4 = self.up4(b)
-        d4 = self.dec4(torch.cat([d4, self._align_skip(e4, d4)], dim=1))
-        d3 = self.up3(d4)
-        d3 = self.dec3(torch.cat([d3, self._align_skip(e3, d3)], dim=1))
-        d2 = self.up2(d3)
-        d2 = self.dec2(torch.cat([d2, self._align_skip(e2, d2)], dim=1))
-        d1 = self.up1(d2)
-        d1 = self.dec1(torch.cat([d1, self._align_skip(e1, d1)], dim=1))
-
-        out = self.out_conv(d1)
-        return torch.sigmoid(out)
-
-class AttentionGate3D(nn.Module):
+# ---- encoder/decoder with MPS-friendly ops ----
+class Down(nn.Module):
     """
-    3D Attention Gate (from Oktay et al., Attention U-Net 2018).
-    Filters encoder features before skip concatenation.
+    MPS-safe downsampling: stride-2 3D conv instead of MaxPool3d.
     """
-    def __init__(self, g_ch, x_ch, inter_ch):
+    def __init__(self, cin, cout):
         super().__init__()
-        self.W_g = nn.Sequential(
-            nn.Conv3d(g_ch, inter_ch, 1, stride=1, padding=0, bias=True),
-            nn.InstanceNorm3d(inter_ch)
+        self.down = nn.Conv3d(cin, cin, kernel_size=2, stride=2, bias=False)
+        self.conv = nn.Sequential(
+            Conv3dIN(cin, cout),
+            ResBlock3D(cout),
+            scSE(cout),
         )
-        self.W_x = nn.Sequential(
-            nn.Conv3d(x_ch, inter_ch, 1, stride=1, padding=0, bias=True),
-            nn.InstanceNorm3d(inter_ch)
-        )
-        self.psi = nn.Sequential(
-            nn.Conv3d(inter_ch, 1, 1, stride=1, padding=0, bias=True),
-            nn.InstanceNorm3d(1),
-            nn.Sigmoid()
-        )
-        self.relu = nn.ReLU(inplace=True)
+    def forward(self, x):
+        x = self.down(x)
+        return self.conv(x)
 
-    def forward(self, g, x):
-        g1 = self.W_g(g)
-        x1 = self.W_x(x)
-        psi = self.relu(g1 + x1)
-        psi = self.psi(psi)
-        return x * psi
-
-class ImprovedUNet3D(nn.Module):
-    """U-Net + Attention Gates"""
-    def __init__(self, in_channels=1, out_channels=1, base_ch=32):
+class Up(nn.Module):
+    """
+    MPS-safe upsampling: trilinear upsample + 1x1 conv (no ConvTranspose3d).
+    Note: after upsample we concat with skip (channels=cout), so input to conv = 2*cout.
+    """
+    def __init__(self, cin, cout):
         super().__init__()
+        # reduce channels to cout after upsample
+        self.up = nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False)
+        self.reduce = nn.Conv3d(cin, cout, kernel_size=1, stride=1, bias=False)
+        self.conv = nn.Sequential(
+            Conv3dIN(cout * 2, cout),
+            ResBlock3D(cout),
+            scSE(cout),
+        )
 
-        self.enc1 = conv_block(in_channels, base_ch)
-        self.enc2 = down_block(base_ch, base_ch * 2)
-        self.enc3 = down_block(base_ch * 2, base_ch * 4)
-        self.enc4 = down_block(base_ch * 4, base_ch * 8)
-        self.bottleneck = conv_block(base_ch * 8, base_ch * 16)
+    def forward(self, x, skip):
+        x = self.up(x)           # (N, cin, ..) -> spatial up by 2
+        x = self.reduce(x)       # (N, cout, ..)
+        # pad if needed for odd dims
+        diff_d = skip.size(-3) - x.size(-3)
+        diff_h = skip.size(-2) - x.size(-2)
+        diff_w = skip.size(-1) - x.size(-1)
+        if diff_d or diff_h or diff_w:
+            x = F.pad(x, [0, max(0, diff_w), 0, max(0, diff_h), 0, max(0, diff_d)])
+        x = torch.cat([skip, x], dim=1)  # channels = cout + cout = 2*cout
+        return self.conv(x)
 
-        # Attention gates
-        self.ag4 = AttentionGate3D(g_ch=base_ch * 8, x_ch=base_ch * 8, inter_ch=base_ch * 4)
-        self.ag3 = AttentionGate3D(g_ch=base_ch * 4, x_ch=base_ch * 4, inter_ch=base_ch * 2)
-        self.ag2 = AttentionGate3D(g_ch=base_ch * 2, x_ch=base_ch * 2, inter_ch=base_ch)
+# ---- UNet3D Improved ----
+class UNet3D_Improved(nn.Module):
+    def __init__(self, in_channels=1, num_classes=6, base=32, deep_supervision=True):
+        super().__init__()
+        chs = [base, base*2, base*4, base*8, base*10]
+        self.ds = deep_supervision
 
-        self.up4 = up_block(base_ch * 16, base_ch * 8)
-        self.dec4 = conv_block(base_ch * 16, base_ch * 8)
-        self.up3 = up_block(base_ch * 8, base_ch * 4)
-        self.dec3 = conv_block(base_ch * 8, base_ch * 4)
-        self.up2 = up_block(base_ch * 4, base_ch * 2)
-        self.dec2 = conv_block(base_ch * 4, base_ch * 2)
-        self.up1 = up_block(base_ch * 2, base_ch)
-        self.dec1 = conv_block(base_ch * 2, base_ch)
+        self.in_conv = nn.Sequential(
+            Conv3dIN(in_channels, chs[0]),
+            ResBlock3D(chs[0]),
+            scSE(chs[0]),
+        )
+        self.d1 = Down(chs[0], chs[1])
+        self.d2 = Down(chs[1], chs[2])
+        self.d3 = Down(chs[2], chs[3])
 
-        self.out_conv = nn.Conv3d(base_ch, out_channels, 1)
+        self.bn = nn.Sequential(
+            Conv3dIN(chs[3], chs[4]),
+            ResBlock3D(chs[4]),
+            nn.Dropout3d(0.1),
+        )
+
+        self.u3 = Up(chs[4], chs[3])  # up: 10b -> 8b
+        self.u2 = Up(chs[3], chs[2])  # up: 8b -> 4b
+        self.u1 = Up(chs[2], chs[1])  # up: 4b -> 2b
+        self.u0 = Up(chs[1], chs[0])  # up: 2b -> 1b
+
+        self.out0 = nn.Conv3d(chs[0], num_classes, 1)
+        if self.ds:
+            self.out1 = nn.Conv3d(chs[1], num_classes, 1)
+            self.out2 = nn.Conv3d(chs[2], num_classes, 1)
+            self.out3 = nn.Conv3d(chs[3], num_classes, 1)
 
     def forward(self, x):
-        e1 = self.enc1(x)
-        e2 = self.enc2(e1)
-        e3 = self.enc3(e2)
-        e4 = self.enc4(e3)
-        b = self.bottleneck(e4)
+        x0 = self.in_conv(x)
+        x1 = self.d1(x0)
+        x2 = self.d2(x1)
+        x3 = self.d3(x2)
+        xb = self.bn(x3)
 
-        d4 = self.up4(b)
-        att4 = self.ag4(g=d4, x=self._align_skip(e4, d4))
-        d4 = self.dec4(torch.cat([d4, att4], dim=1))
+        y3 = self.u3(xb, x3)
+        y2 = self.u2(y3, x2)
+        y1 = self.u1(y2, x1)
+        y0 = self.u0(y1, x0)
 
-        d3 = self.up3(d4)
-        att3 = self.ag3(g=d3, x=self._align_skip(e3, d3))
-        d3 = self.dec3(torch.cat([d3, att3], dim=1))
+        logits0 = self.out0(y0)
+        if not self.ds:
+            return logits0
 
-        d2 = self.up2(d3)
-        att2 = self.ag2(g=d2, x=self._align_skip(e2, d2))
-        d2 = self.dec2(torch.cat([d2, att2], dim=1))
-
-        d1 = self.up1(d2)
-        d1 = self.dec1(torch.cat([d1, self._align_skip(e1, d1)], dim=1))
-        out = self.out_conv(d1)
-        return torch.sigmoid(out)
-
-    @staticmethod
-    def _align_skip(skip: torch.Tensor, upsampled: torch.Tensor) -> torch.Tensor:
-        if skip.shape[2:] != upsampled.shape[2:]:
-            return F.interpolate(skip, size=upsampled.shape[2:], mode="trilinear", align_corners=False)
-        return skip
+        # deep supervision: upsample aux heads to full res
+        logits1 = F.interpolate(self.out1(y1), size=logits0.shape[-3:], mode='trilinear', align_corners=False)
+        logits2 = F.interpolate(self.out2(y2), size=logits0.shape[-3:], mode='trilinear', align_corners=False)
+        logits3 = F.interpolate(self.out3(y3), size=logits0.shape[-3:], mode='trilinear', align_corners=False)
+        return [logits0, logits1, logits2, logits3]

@@ -1,281 +1,207 @@
-import os, csv, time
+# train.py
+import os, math, random, contextlib
 import numpy as np
 import torch
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
-from dataset import find_patients, ProstatePatchDataset
-from modules import UNet3D, ImprovedUNet3D
-from utils import (
-    check_cuda, set_seed, dice_coefficient,
-    DiceLoss, HybridLoss
-)
+from dataset import find_pairs, split_by_patient, Prostate3DDataset, NUM_CLASSES
+from modules import UNet3D_Improved
 
-# -------------------- CONFIG (edit here) --------------------
-CFG = {
-    "DATA_ROOT": "Prostate3D_data",
-    "SAVE_DIR":  "runs",
+# ===============================================================
+# CONFIGURATION (edit these as needed)
+# ===============================================================
+EPOCHS        = 200
+BATCH_SIZE    = 2
+ACCUM_STEPS   = 2                # gradient accumulation steps
+PATCH_SIZE    = (128, 128, 96)
+LR            = 3e-4
+WEIGHT_DECAY  = 1e-4
+NUM_WORKERS   = 4
+SEED          = 1337
+SAVE_DIR      = "runs"
+USE_DEEP_SUP  = True             # False disables deep supervision
+WARMUP_STEPS  = 1000
+TOTAL_STEPS_OVERRIDE = 0         # 0 = auto-calc from epochs
+GRAD_CLIP_NORM = 12.0
+# ===============================================================
 
-    "MODEL": "improved",          # "unet" or "improved"
-    "LOSS":  "dice",              # "dice" or "hybrid"
+# ----------------- Utils -----------------
+def set_seed(seed=1337):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-    "EPOCHS": 20,
-    "BATCH_SIZE": 1,
-    "PATCH": (64, 64, 64),        # safe on CPU; use (96,96,96) on GPU
-    "SEED": 1337,
-    "SUBSET": 40,                 # 0 = all; small number for quick tests
-
-    "NUM_WORKERS": 0,
-    "PIN_MEMORY": False,
-
-    "LR": 3e-4,
-    "WEIGHT_DECAY": 1e-4,
-    "GRAD_CLIP": 1.0,
-
-    "LR_PATIENCE": 5,
-    "LR_FACTOR": 0.5,
-    "EARLY_STOP_TARGET": 0.70,    # stop once val Dice ≥ target for N epochs
-    "EARLY_STOP_PATIENCE": 2,
-
-    "USE_AMP": torch.cuda.is_available(),
-
-    # Hybrid loss focal alpha: if None, auto-estimate from foreground frequency
-    "FOCAL_ALPHA": None,
-    "FOCAL_GAMMA": 2.0,
-}
-# -------------------------------------------------------------
-
-def _match_spatial_size(t: torch.Tensor, ref: torch.Tensor, is_mask: bool) -> torch.Tensor:
-    """Resize tensor t to ref's (D,H,W)."""
-    if t.shape[-3:] == ref.shape[-3:]:
-        return t
-    size = ref.shape[-3:]
-    if is_mask:
-        return F.interpolate(t, size=size, mode="nearest")
+def setup_device():
+    if torch.cuda.is_available():
+        device = torch.device("cuda"); device_type = "cuda"
+    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        device = torch.device("mps"); device_type = "mps"
     else:
-        return F.interpolate(t, size=size, mode="trilinear", align_corners=False)
+        device = torch.device("cpu"); device_type = "cpu"
+    print(f"Using device: {device}")
+    return device, device_type
 
-def ensure_dir(p): os.makedirs(p, exist_ok=True)
-
-@torch.no_grad()
-def _estimate_fg_alpha(loader, max_batches=8):
+def dice_per_class(probs, target, num_classes=NUM_CLASSES, eps=1e-6):
     """
-    Estimate Focal alpha from foreground prevalence.
-    alpha ~ (1 - fg_fraction) so minority class gets higher weight.
+    probs: (N,C,D,H,W) softmax probabilities
+    target: (N,D,H,W) int64
+    returns tensor of size (C-1,) for classes 1..C-1 (background ignored)
     """
-    total_vox = 0
-    fg_vox = 0
-    seen = 0
-    for batch in loader:
-        y = batch["mask"]
-        total_vox += y.numel()
-        fg_vox += (y > 0).sum().item()
-        seen += 1
-        if seen >= max_batches: break
-    fg_frac = max(1e-6, min(1.0 - 1e-6, fg_vox / max(1, total_vox)))
-    alpha = 1.0 - fg_frac
-    return float(alpha), float(fg_frac)
+    t_one = F.one_hot(target.long(), num_classes).permute(0,4,1,2,3).float()
+    dices = []
+    for c in range(1, num_classes):
+        pc, tc = probs[:, c], t_one[:, c]
+        inter = (pc * tc).sum(dim=(1,2,3))
+        denom = pc.sum(dim=(1,2,3)) + tc.sum(dim=(1,2,3))
+        dices.append(((2*inter + eps) / (denom + eps)).mean())
+    return torch.stack(dices)  # (C-1,)
 
-def _overlay_central_axial(img_chn_first: torch.Tensor,  # (1,D,H,W)
-                           mask_bin: torch.Tensor,       # (1,D,H,W) or (D,H,W)
-                           pred_bin: torch.Tensor,       # (1,D,H,W) or (D,H,W)
-                           save_path: str):
-    """
-    Save a 3x1 grid: image, GT, Pred (central axial slice).
-    """
-    ensure_dir(os.path.dirname(save_path))
-    if img_chn_first.dim() == 4:
-        img = img_chn_first[0].cpu().numpy()  # (D,H,W)
-    else:
-        img = img_chn_first.cpu().numpy()
-    if mask_bin.dim() == 4: mask = mask_bin[0].cpu().numpy()
-    else:                   mask = mask_bin.cpu().numpy()
-    if pred_bin.dim() == 4: pred = pred_bin[0].cpu().numpy()
-    else:                   pred = pred_bin.cpu().numpy()
+class DiceCELoss(torch.nn.Module):
+    """ Combined Dice (ignore bg) + CrossEntropy with optional deep supervision. """
+    def __init__(self, num_classes=NUM_CLASSES, ce_weights=None):
+        super().__init__()
+        self.num_classes = num_classes
+        self.ce_weights = ce_weights
 
-    D, H, W = img.shape
-    z = D // 2
-    img2d = img[z]
-    gt2d  = mask[z]
-    pr2d  = pred[z]
+    def forward(self, logits, target):
+        if isinstance(logits, list):  # deep supervision
+            weights = [0.6, 0.2, 0.15, 0.05]
+            return sum(w * self._single(l, target) for w, l in zip(weights, logits))
+        return self._single(logits, target)
 
-    # normalise image to 0..1 for display
-    img2d = (img2d - img2d.min()) / (img2d.max() - img2d.min() + 1e-6)
+    def _single(self, logits, target):
+        ce = F.cross_entropy(logits, target.long(), weight=self.ce_weights)
+        probs = F.softmax(logits, dim=1)
+        dice = 1.0 - dice_per_class(probs, target, self.num_classes).mean()
+        return 0.5 * ce + 0.5 * dice
 
-    fig, axs = plt.subplots(1, 3, figsize=(9, 3))
-    axs[0].imshow(img2d, cmap="gray"); axs[0].set_title("Image"); axs[0].axis("off")
-    axs[1].imshow(gt2d, cmap="gray");  axs[1].set_title("GT");    axs[1].axis("off")
-    axs[2].imshow(pr2d, cmap="gray");  axs[2].set_title("Pred");  axs[2].axis("off")
-    plt.tight_layout(); plt.savefig(save_path, dpi=150); plt.close()
+def make_scheduler(optimizer, warmup_steps, total_steps):
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return float(step + 1) / float(max(1, warmup_steps))
+        progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-def train_one_epoch(model, loader, opt, loss_fn, device, use_amp=True, grad_clip=1.0):
+# ----------------- Training & Eval -----------------
+def train_one_epoch(model, loader, optimizer, scaler, loss_fn, device, device_type, grad_accum=1, log_every=50):
     model.train()
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     running = 0.0
-    pbar = tqdm(loader, desc="Train", leave=False)
-    for batch in pbar:
-        x = batch["image"].to(device)                        # (N,1,D,H,W)
-        y = batch["mask"].float().to(device).unsqueeze(1)    # -> (N,1,D,H,W)
+    optimizer.zero_grad(set_to_none=True)
 
-        opt.zero_grad(set_to_none=True)
-        with torch.amp.autocast("cuda", enabled=use_amp):
-            p = model(x)
-            y_ = _match_spatial_size(y, p, is_mask=True)
-            p_ = _match_spatial_size(p, y_, is_mask=False)
-            loss = loss_fn(p_, y_)
-        scaler.scale(loss).backward()
-        if grad_clip and grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        scaler.step(opt); scaler.update()
+    for it, (img, lab) in enumerate(loader, 1):
+        img = img.to(device, non_blocking=(device_type=="cuda"))
+        lab = lab.to(device, non_blocking=(device_type=="cuda"))
 
-        running += loss.item()
-        pbar.set_postfix(loss=float(loss))
+        autocast_ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.float16)
+            if device_type == "cuda" else contextlib.nullcontext()
+        )
+        with autocast_ctx:
+            logits = model(img)
+            loss = loss_fn(logits, lab) / grad_accum
+
+        if scaler is not None and getattr(scaler, "is_enabled", lambda: False)():
+            scaler.scale(loss).backward()
+            if it % grad_accum == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+                scaler.step(optimizer); scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+        else:
+            loss.backward()
+            if it % grad_accum == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+        running += float(loss.item()) * grad_accum
+        if log_every and it % log_every == 0:
+            print(f"  iter {it:04d}/{len(loader)}  loss {running/it:.4f}")
+
     return running / max(1, len(loader))
 
 @torch.no_grad()
-def validate(model, loader, device, use_amp=False):
+def evaluate(model, loader, device, device_type):
     model.eval()
     dices = []
-    pbar = tqdm(loader, desc="Valid", leave=False)
-    for batch in pbar:
-        x = batch["image"].to(device)
-        y = batch["mask"].float().to(device).unsqueeze(1)
-        with torch.amp.autocast("cuda", enabled=use_amp):
-            p = model(x)
-            y_ = _match_spatial_size(y, p, is_mask=True)
-            p_ = _match_spatial_size(p, y_, is_mask=False)
-            dices.append(dice_coefficient(p_, y_).item())
-    return float(np.mean(dices)) if dices else 0.0
+    for img, lab in loader:
+        img = img.to(device, non_blocking=(device_type=="cuda"))
+        lab = lab.to(device, non_blocking=(device_type=="cuda"))
+        logits = model(img)
+        if isinstance(logits, list): logits = logits[0]
+        probs = F.softmax(logits, dim=1)
+        d = dice_per_class(probs, lab)  # (C-1,)
+        dices.append(d.unsqueeze(0))
+    if not dices:
+        return torch.zeros(NUM_CLASSES-1)
+    return torch.cat(dices, 0).mean(0).cpu()
 
+# ----------------- Main -----------------
 def main():
-    cfg = CFG
-    device = check_cuda()
-    set_seed(cfg["SEED"])
-    ensure_dir(cfg["SAVE_DIR"])
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    set_seed(SEED)
 
-    # ---------- split ----------
-    items = find_patients(cfg["DATA_ROOT"])
-    ids = [it.pid for it in items]
-    if cfg["SUBSET"] and cfg["SUBSET"] < len(ids):
-        ids = ids[:cfg["SUBSET"]]
-    n_train = int(0.7 * len(ids))
-    train_ids, val_ids = ids[:n_train], ids[n_train:]
-    print(f"Split → train: {len(train_ids)}, val: {len(val_ids)}")
+    device, device_type = setup_device()
 
-    # ---------- data ----------
-    patch = tuple(cfg["PATCH"])
-    train_ds = ProstatePatchDataset(cfg["DATA_ROOT"], train_ids, patch_size=patch,
-                                    mode="train", augment=True, normImage=True, orient=True)
-    val_ds   = ProstatePatchDataset(cfg["DATA_ROOT"], val_ids,   patch_size=patch,
-                                    mode="val", augment=False, normImage=True, orient=True)
-    pin_memory = bool(cfg["PIN_MEMORY"] and torch.cuda.is_available())
-    tr_loader = DataLoader(train_ds, batch_size=cfg["BATCH_SIZE"], shuffle=True,
-                           num_workers=cfg["NUM_WORKERS"], pin_memory=pin_memory)
-    va_loader = DataLoader(val_ds, batch_size=cfg["BATCH_SIZE"], shuffle=False,
-                           num_workers=cfg["NUM_WORKERS"], pin_memory=pin_memory)
+    # ---------- Data ----------
+    pairs = find_pairs()
+    train_pairs, val_pairs, test_pairs = split_by_patient(pairs, train_ratio=0.7, val_ratio=0.15, seed=SEED)
+    print(f"Split → train {len(train_pairs)} | val {len(val_pairs)} | test {len(test_pairs)}")
 
-    # ---------- model ----------
-    if cfg["MODEL"].lower() == "improved":
-        model = ImprovedUNet3D(in_channels=1, out_channels=1, base_ch=32).to(device)
-        print("🧠 Using ImprovedUNet3D (with Attention Gates)")
-    else:
-        model = UNet3D(in_channels=1, out_channels=1, base_ch=32).to(device)
-        print("🧠 Using UNet3D (baseline)")
+    train_ds = Prostate3DDataset(train_pairs, patch_size=PATCH_SIZE, augment=True,  patch_prob_fg=0.6)
+    val_ds   = Prostate3DDataset(val_pairs,   patch_size=PATCH_SIZE, augment=False, patch_prob_fg=0.0)
 
-    # ---------- loss ----------
-    if cfg["LOSS"].lower() == "hybrid":
-        # Optionally set Focal alpha from data
-        if cfg["FOCAL_ALPHA"] is None:
-            alpha, fg_frac = _estimate_fg_alpha(tr_loader, max_batches=6)
-            print(f"[info] Auto Focal alpha={alpha:.3f} (fg fraction ~{fg_frac:.3f})")
-            # patch HybridLoss to use this alpha
-            class _Hybrid(HybridLoss):
-                def __init__(self): super().__init__()
-                def forward(self, pred, target):
-                    # swap Focal alpha on the fly
-                    self.focal.alpha = alpha
-                    return super().forward(pred, target)
-            loss_fn = _Hybrid()
-        else:
-            loss_fn = HybridLoss()
-        print("⚖️ Using HybridLoss (Dice + Focal)")
-    else:
-        loss_fn = DiceLoss()
-        print("⚖️ Using DiceLoss only")
+    pin = (device_type == "cuda")
+    train_ld = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                          num_workers=NUM_WORKERS, pin_memory=pin)
+    val_ld   = DataLoader(val_ds, batch_size=1, shuffle=False,
+                          num_workers=max(1, NUM_WORKERS//2), pin_memory=pin)
 
-    # ---------- optim / sched ----------
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg["LR"], weight_decay=cfg["WEIGHT_DECAY"])
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max",
-                                                       patience=cfg["LR_PATIENCE"], factor=cfg["LR_FACTOR"])
+    # ---------- Model ----------
+    model = UNet3D_Improved(
+        in_channels=1,
+        num_classes=NUM_CLASSES,
+        deep_supervision=USE_DEEP_SUP,
+        base=32,
+    ).to(device)
 
-    # ---------- CSV log ----------
-    csv_path = os.path.join(cfg["SAVE_DIR"], "metrics.csv")
-    with open(csv_path, "w", newline="") as f:
-        csv.writer(f).writerow(["epoch", "train_loss", "val_dice", "lr"])
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
-    best = 0.0
-    hit_target_ep = None
-    patience_counter = 0
-    train_losses, val_dices = [], []
+    # GradScaler on CUDA only
+    scaler = torch.amp.GradScaler() if device_type == "cuda" else None
 
-    print(f"Training for {cfg['EPOCHS']} epochs on {device} ...")
-    for ep in range(1, cfg["EPOCHS"] + 1):
-        t0 = time.time()
-        tr_loss = train_one_epoch(model, tr_loader, opt, loss_fn, device,
-                                  use_amp=cfg["USE_AMP"], grad_clip=cfg["GRAD_CLIP"])
-        val_dice = validate(model, va_loader, device, use_amp=False)
-        sched.step(val_dice)
+    loss_fn = DiceCELoss(NUM_CLASSES)
 
-        train_losses.append(tr_loss); val_dices.append(val_dice)
-        with open(csv_path, "a", newline="") as f:
-            csv.writer(f).writerow([ep, f"{tr_loss:.6f}", f"{val_dice:.6f}", f"{opt.param_groups[0]['lr']:.6f}"])
+    total_steps = TOTAL_STEPS_OVERRIDE or (EPOCHS * max(1, len(train_ld)//max(1, ACCUM_STEPS)))
+    scheduler = make_scheduler(optimizer, warmup_steps=WARMUP_STEPS, total_steps=total_steps)
 
-        # save example overlay from first val batch
-        try:
-            x0 = next(iter(va_loader))  # (safe: small batch)
-            x = x0["image"].to(device); y = x0["mask"].to(device).unsqueeze(1).float()
-            with torch.no_grad():
-                p = model(x)
-                y_ = _match_spatial_size(y, p, is_mask=True)
-                p_ = _match_spatial_size(p, y_, is_mask=False)
-                p_bin = (p_ > 0.5).float()
-                _overlay_central_axial(x[0].cpu(), y_[0].cpu(), p_bin[0].cpu(),
-                                       os.path.join(cfg["SAVE_DIR"], f"val_ep{ep:03d}.png"))
-        except Exception as e:
-            print(f"[viz warn] overlay failed: {e}")
+    # ---------- Train ----------
+    best_mean = -1.0
+    best_path = os.path.join(SAVE_DIR, "best_improved_unet3d.pt")
+    step = 0
 
-        dt = time.time() - t0
-        print(f"[{ep:03d}] loss={tr_loss:.4f} | val_dice={val_dice:.4f} | lr={opt.param_groups[0]['lr']:.2e} | {dt:.1f}s")
+    for epoch in range(1, EPOCHS + 1):
+        tr_loss = train_one_epoch(
+            model, train_ld, optimizer, scaler, loss_fn,
+            device, device_type, grad_accum=ACCUM_STEPS
+        )
 
-        # checkpoint
-        if val_dice > best:
-            best = val_dice
-            torch.save(model.state_dict(), os.path.join(cfg["SAVE_DIR"], "best.ckpt"))
+        # step-wise scheduler: advance by number of optimizer steps taken this epoch
+        steps_this_epoch = math.ceil(len(train_ld) / max(1, ACCUM_STEPS))
+        for _ in range(steps_this_epoch):
+            scheduler.step(); step += 1
 
-        # early stop when target maintained for patience epochs
-        if val_dice >= cfg["EARLY_STOP_TARGET"] - 1e-6:
-            hit_target_ep = hit_target_ep or ep
-            patience_counter = ep - hit_target_ep
-            if patience_counter >= cfg["EARLY_STOP_PATIENCE"]:
-                print(f"[early stop] Val Dice ≥ {cfg['EARLY_STOP_TARGET']} for {cfg['EARLY_STOP_PATIENCE']} epoch(s).")
-                break
-        else:
-            hit_target_ep = None
-            patience_counter = 0
+        val_dice = evaluate(model, val_ld, device, device_type)   # tensor (C-1,)
+        mean_dice = float(val_dice.mean().item())
+        print(f"Epoch {epoch:03d} | loss {tr_loss:.4f} | val mean Dice {mean_dice:.3f} | per-class {val_dice.tolist()}")
 
-    # curves
-    try:
-        plt.figure(); plt.plot(train_losses, label="train loss"); plt.legend(); plt.tight_layout()
-        plt.savefig(os.path.join(cfg["SAVE_DIR"], "loss_curve.png")); plt.close()
-        plt.figure(); plt.plot(val_dices, label="val dice"); plt.legend(); plt.tight_layout()
-        plt.savefig(os.path.join(cfg["SAVE_DIR"], "dice_curve.png")); plt.close()
-    except Exception as e:
-        print(f"[plot warn] {e}")
+        if mean_dice > best_mean:
+            best_mean = mean_dice
+            torch.save(model.state_dict(), best_path)
+            print(f"  ✅ New best mean Dice {best_mean:.3f} — saved to {best_path}")
 
-    print(f"✅ Done. Best Val Dice = {best:.4f}")
-    print(f"Logs & checkpoints → {cfg['SAVE_DIR']}")
+    print(f"Training complete. Best val mean Dice: {best_mean:.3f}")
 
 if __name__ == "__main__":
     main()
