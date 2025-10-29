@@ -9,21 +9,30 @@ import torch
 from torch.utils.data import Dataset
 
 # -----------------------------------------------------
-# Detect Environment and Set Dataset Paths
+# Dataset path setup — defaults to Rangpur but works locally
 # -----------------------------------------------------
-hostname = socket.gethostname()
 
-if "rangpur" in hostname.lower():
-    # UQ Rangpur cluster paths
-    DATA_ROOT = "/home/groups/comp3710/HipMRI_Study_open"
-    IMAGES_DIR = os.path.join(DATA_ROOT, "semantic_MRs")
-    LABELS_DIR = os.path.join(DATA_ROOT, "semantic_labels_only")
+# Rangpur cluster dataset
+RANGPUR_ROOT  = "/home/groups/comp3710/HipMRI_Study_open"
+RANGPUR_IMGS  = os.path.join(RANGPUR_ROOT, "semantic_MRs")
+RANGPUR_LABELS = os.path.join(RANGPUR_ROOT, "semantic_labels_only")
+
+# Local fallback (for debugging / testing)
+LOCAL_ROOT = os.path.join(os.path.dirname(__file__), "Prostate3D_data")
+LOCAL_IMGS = os.path.join(LOCAL_ROOT, "semantic_MRs_anon")
+LOCAL_LABELS = os.path.join(LOCAL_ROOT, "semantic_labels_anon")
+
+# Automatically pick Rangpur if it exists, else local
+if os.path.exists(RANGPUR_IMGS) and os.path.exists(RANGPUR_LABELS):
+    DATA_ROOT  = RANGPUR_ROOT
+    IMAGES_DIR = RANGPUR_IMGS
+    LABELS_DIR = RANGPUR_LABELS
+    print(f"[dataset] Using Rangpur dataset at: {DATA_ROOT}")
 else:
-    # Local folder layout
-    ROOT_DIR = os.path.dirname(__file__)
-    DATA_ROOT = os.path.join(ROOT_DIR, "Prostate3D_data")
-    IMAGES_DIR = os.path.join(DATA_ROOT, "semantic_MRs_anon")
-    LABELS_DIR = os.path.join(DATA_ROOT, "semantic_labels_anon")
+    DATA_ROOT  = LOCAL_ROOT
+    IMAGES_DIR = LOCAL_IMGS
+    LABELS_DIR = LOCAL_LABELS
+    print(f"[dataset] Using local dataset at: {DATA_ROOT}")
 
 # -----------------------------
 # Filename parsing
@@ -117,29 +126,46 @@ def to_one_hot(lbl: np.ndarray, label_map: Dict[int, int], dtype=np.uint8) -> np
 
 
 # -----------------------------
-# Pair discovery
+# Pair discovery (robust to names)
 # -----------------------------
+# Accept keys like: B006_Week0_*.nii.gz  OR  Case_004_Week6_*.nii.gz
+KEY_RE = re.compile(r"^((?:Case_\d+)|(?:[A-Za-z]\d+))_Week(\d+).+\.nii\.gz$", re.IGNORECASE)
+
+
+def _index_by_key(dir_path: str) -> dict:
+    idx = {}
+    files = sorted([f for f in os.listdir(dir_path) if f.endswith(".nii.gz")])
+    for f in files:
+        m = KEY_RE.match(f)
+        if not m:
+            continue
+        case, week = m.group(1), int(m.group(2))
+        idx[(case, week)] = os.path.join(dir_path, f)
+    return idx
+
 def find_pairs(images_dir: str = IMAGES_DIR,
                labels_dir: str = LABELS_DIR) -> List[Tuple[str, str, str, int]]:
     """
-    Returns a list of (img_path, lbl_path, patient_id, week).
-    Only keeps pairs where both MRI and label exist.
+    Returns a list of (img_path, lbl_path, patient_id, week),
+    matched by (Case_xxx, WeekN). Robust to extra tokens like LFOV/SEMANTIC/etc.
     """
-    pairs = []
-    for fname in sorted(os.listdir(images_dir)):
-        if not fname.endswith(".nii.gz"):
-            continue
-        parsed = parse_mri_name(fname)
-        if not parsed:
-            continue
-        case, week = parsed
-        img_path = os.path.join(images_dir, fname)
-        lbl_name = expected_label_name_from_mri(fname)
-        lbl_path = os.path.join(labels_dir, lbl_name)
-        if os.path.exists(lbl_path):
-            pairs.append((img_path, lbl_path, case, week))
+    img_idx = _index_by_key(images_dir)
+    lbl_idx = _index_by_key(labels_dir)
+
+    # intersect keys
+    keys = sorted(set(img_idx.keys()) & set(lbl_idx.keys()))
+    pairs = [(img_idx[k], lbl_idx[k], k[0], k[1]) for k in keys]
+
     if not pairs:
-        raise RuntimeError("No (image,label) pairs found. Check folder names and patterns.")
+        # Helpful diagnostics
+        imgs = sorted([f for f in os.listdir(images_dir) if f.endswith(".nii.gz")])[:5]
+        lbls = sorted([f for f in os.listdir(labels_dir) if f.endswith(".nii.gz")])[:5]
+        raise RuntimeError(
+            "No (image,label) pairs found by (Case_xxx, WeekN) key.\n"
+            f"Checked folders:\n  images_dir={images_dir}\n  labels_dir={labels_dir}\n"
+            f"Example image files: {imgs}\nExample label files: {lbls}\n"
+            "Ensure filenames look like 'Case_004_Week6_*.nii.gz'."
+        )
     return pairs
 
 
