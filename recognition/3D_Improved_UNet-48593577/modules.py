@@ -1,133 +1,209 @@
-# modules.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ---- blocks ----
-class Conv3dIN(nn.Sequential):
-    def __init__(self, cin, cout, k=3, s=1, p=1):
-        super().__init__(
-            nn.Conv3d(cin, cout, k, s, p, bias=False),
-            nn.InstanceNorm3d(cout, affine=True),
-            nn.LeakyReLU(0.1, inplace=True),
+
+# -------------------------
+# Building blocks
+# -------------------------
+def conv3x3(in_ch, out_ch, stride=1, groups=1, dilation=1):
+    return nn.Conv3d(in_ch, out_ch, kernel_size=3, stride=stride,
+                     padding=dilation, groups=groups, bias=False, dilation=dilation)
+
+def conv1x1(in_ch, out_ch, stride=1):
+    return nn.Conv3d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False)
+
+
+class SEBlock3D(nn.Module):
+    """Squeeze-and-Excitation to reweight channels (lightweight)."""
+    def __init__(self, ch, r=8):
+        super().__init__()
+        self.avg = nn.AdaptiveAvgPool3d(1)
+        self.fc = nn.Sequential(
+            nn.Conv3d(ch, ch // r, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(ch // r, ch, 1, bias=True),
+            nn.Sigmoid()
         )
 
-class ResBlock3D(nn.Module):
-    def __init__(self, c):
-        super().__init__()
-        self.conv1 = Conv3dIN(c, c)
-        self.conv2 = Conv3dIN(c, c)
     def forward(self, x):
-        return x + self.conv2(self.conv1(x))
+        w = self.avg(x)
+        w = self.fc(w)
+        return x * w
 
-class scSE(nn.Module):
-    def __init__(self, c, r=8):
+
+class ResidualConvBlock3D(nn.Module):
+    """
+    Two 3x3 convs with GroupNorm + ReLU and a residual connection.
+    Optionally applies SE channel attention at the end.
+    """
+    def __init__(self, in_ch, out_ch, groups=8, se=True, dropout=0.0):
         super().__init__()
-        self.cSE = nn.Sequential(
-            nn.AdaptiveAvgPool3d(1),
-            nn.Conv3d(c, c // r, 1), nn.ReLU(inplace=True),
-            nn.Conv3d(c // r, c, 1), nn.Sigmoid()
-        )
-        self.sSE = nn.Sequential(nn.Conv3d(c, 1, 1), nn.Sigmoid())
+        self.conv1 = conv3x3(in_ch, out_ch)
+        self.gn1   = nn.GroupNorm(num_groups=min(groups, out_ch), num_channels=out_ch)
+        self.conv2 = conv3x3(out_ch, out_ch)
+        self.gn2   = nn.GroupNorm(num_groups=min(groups, out_ch), num_channels=out_ch)
+        self.relu  = nn.ReLU(inplace=True)
+        self.se    = SEBlock3D(out_ch) if se else nn.Identity()
+        self.drop  = nn.Dropout3d(p=dropout) if dropout > 0 else nn.Identity()
+        self.proj  = conv1x1(in_ch, out_ch) if in_ch != out_ch else nn.Identity()
+
     def forward(self, x):
-        return x * self.cSE(x) + x * self.sSE(x)
+        identity = self.proj(x)
+        out = self.relu(self.gn1(self.conv1(x)))
+        out = self.drop(self.relu(self.gn2(self.conv2(out))))
+        out = self.se(out)
+        out = self.relu(out + identity)
+        return out
 
-# ---- encoder/decoder with MPS-friendly ops ----
-class Down(nn.Module):
-    """
-    MPS-safe downsampling: stride-2 3D conv instead of MaxPool3d.
-    """
-    def __init__(self, cin, cout):
-        super().__init__()
-        self.down = nn.Conv3d(cin, cin, kernel_size=2, stride=2, bias=False)
-        self.conv = nn.Sequential(
-            Conv3dIN(cin, cout),
-            ResBlock3D(cout),
-            scSE(cout),
-        )
-    def forward(self, x):
-        x = self.down(x)
-        return self.conv(x)
 
-class Up(nn.Module):
+class AttGate3D(nn.Module):
     """
-    MPS-safe upsampling: trilinear upsample + 1x1 conv (no ConvTranspose3d).
-    Note: after upsample we concat with skip (channels=cout), so input to conv = 2*cout.
+    Attention gate from "Attention U-Net".
+    Takes encoder feature (skip) and decoder gate (g).
     """
-    def __init__(self, cin, cout):
+    def __init__(self, in_ch_skip, in_ch_g, inter_ch):
         super().__init__()
-        # reduce channels to cout after upsample
-        self.up = nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False)
-        self.reduce = nn.Conv3d(cin, cout, kernel_size=1, stride=1, bias=False)
-        self.conv = nn.Sequential(
-            Conv3dIN(cout * 2, cout),
-            ResBlock3D(cout),
-            scSE(cout),
+        self.theta = conv1x1(in_ch_skip, inter_ch)
+        self.phi   = conv1x1(in_ch_g, inter_ch)
+        self.psi   = nn.Sequential(
+            nn.ReLU(inplace=True),
+            conv1x1(inter_ch, 1),
+            nn.Sigmoid()
         )
+
+    def forward(self, x_skip, g):
+        # match spatial dims by interpolation of g
+        if g.shape[-3:] != x_skip.shape[-3:]:
+            g = F.interpolate(g, size=x_skip.shape[-3:], mode="trilinear", align_corners=False)
+        att = self.theta(x_skip) + self.phi(g)
+        att = self.psi(att)
+        return x_skip * att
+
+
+class UpBlock3D(nn.Module):
+    def __init__(self, in_ch, out_ch, use_att=False, skip_ch=None):
+        super().__init__()
+        self.up = nn.ConvTranspose3d(in_ch, out_ch, kernel_size=2, stride=2)
+        self.use_att = use_att
+        if use_att:
+            assert skip_ch is not None, "skip_ch must be provided when use_att=True"
+            self.att = AttGate3D(in_ch_skip=skip_ch, in_ch_g=out_ch, inter_ch=max(out_ch // 2, 1))
+            self.fuse = ResidualConvBlock3D(out_ch + skip_ch, out_ch)
+        else:
+            self.fuse = ResidualConvBlock3D(out_ch * 2, out_ch)
 
     def forward(self, x, skip):
-        x = self.up(x)           # (N, cin, ..) -> spatial up by 2
-        x = self.reduce(x)       # (N, cout, ..)
-        # pad if needed for odd dims
-        diff_d = skip.size(-3) - x.size(-3)
-        diff_h = skip.size(-2) - x.size(-2)
-        diff_w = skip.size(-1) - x.size(-1)
-        if diff_d or diff_h or diff_w:
-            x = F.pad(x, [0, max(0, diff_w), 0, max(0, diff_h), 0, max(0, diff_d)])
-        x = torch.cat([skip, x], dim=1)  # channels = cout + cout = 2*cout
-        return self.conv(x)
+        x = self.up(x)
+        # center-crop/pad skip if small mismatch
+        if x.shape[-3:] != skip.shape[-3:]:
+            skip = F.interpolate(skip, size=x.shape[-3:], mode="trilinear", align_corners=False)
 
-# ---- UNet3D Improved ----
-class UNet3D_Improved(nn.Module):
-    def __init__(self, in_channels=1, num_classes=6, base=32, deep_supervision=True):
+        if self.use_att:
+            skip = self.att(skip, x)
+            x = torch.cat([x, skip], dim=1)
+        else:
+            x = torch.cat([x, skip], dim=1)
+        x = self.fuse(x)
+        return x
+
+
+# -------------------------
+# UNet backbone
+# -------------------------
+class UNet3D(nn.Module):
+    """
+    Improved 3D U-Net:
+      - Residual conv blocks + GroupNorm
+      - Optional SE channel attention inside blocks
+      - Optional Attention Gates on skip connections
+    """
+    def __init__(self, in_channels=1, num_classes=2, base_ch=32, depth=4,
+                 use_se=True, use_att=True, dropout=0.0):
         super().__init__()
-        chs = [base, base*2, base*4, base*8, base*10]
-        self.ds = deep_supervision
+        assert depth in (3, 4, 5), "Depth 3-5 is typical for 3D with memory limits."
 
-        self.in_conv = nn.Sequential(
-            Conv3dIN(in_channels, chs[0]),
-            ResBlock3D(chs[0]),
-            scSE(chs[0]),
-        )
-        self.d1 = Down(chs[0], chs[1])
-        self.d2 = Down(chs[1], chs[2])
-        self.d3 = Down(chs[2], chs[3])
+        chs = [base_ch * (2 ** i) for i in range(depth)]  # encoder widths
 
-        self.bn = nn.Sequential(
-            Conv3dIN(chs[3], chs[4]),
-            ResBlock3D(chs[4]),
-            nn.Dropout3d(0.1),
-        )
+        # Encoder
+        self.enc0 = ResidualConvBlock3D(in_channels, chs[0], se=use_se, dropout=dropout)
+        self.down0 = nn.MaxPool3d(2)
 
-        self.u3 = Up(chs[4], chs[3])  # up: 10b -> 8b
-        self.u2 = Up(chs[3], chs[2])  # up: 8b -> 4b
-        self.u1 = Up(chs[2], chs[1])  # up: 4b -> 2b
-        self.u0 = Up(chs[1], chs[0])  # up: 2b -> 1b
+        self.enc1 = ResidualConvBlock3D(chs[0], chs[1], se=use_se, dropout=dropout)
+        self.down1 = nn.MaxPool3d(2)
 
-        self.out0 = nn.Conv3d(chs[0], num_classes, 1)
-        if self.ds:
-            self.out1 = nn.Conv3d(chs[1], num_classes, 1)
-            self.out2 = nn.Conv3d(chs[2], num_classes, 1)
-            self.out3 = nn.Conv3d(chs[3], num_classes, 1)
+        if depth >= 4:
+            self.enc2 = ResidualConvBlock3D(chs[1], chs[2], se=use_se, dropout=dropout)
+            self.down2 = nn.MaxPool3d(2)
+
+        if depth == 5:
+            self.enc3 = ResidualConvBlock3D(chs[2], chs[3], se=use_se, dropout=dropout)
+            self.down3 = nn.MaxPool3d(2)
+
+        # Bottleneck (match encoder stage just before the deepest downsample)
+        if depth == 5:
+            bott_in = chs[3]   # enc3 out
+        elif depth == 4:
+            bott_in = chs[2]   # enc2 out
+        else:  # depth == 3
+            bott_in = chs[1]   # enc1 out
+
+        self.bott = ResidualConvBlock3D(bott_in, bott_in * 2, se=use_se, dropout=dropout)
+
+        # Decoder
+        if depth == 5:
+            self.up3 = UpBlock3D(in_ch=bott_in * 2, out_ch=chs[3], use_att=use_att, skip_ch=chs[3])
+            self.up2 = UpBlock3D(in_ch=chs[3],       out_ch=chs[2], use_att=use_att, skip_ch=chs[2])
+            self.up1 = UpBlock3D(in_ch=chs[2],       out_ch=chs[1], use_att=use_att, skip_ch=chs[1])
+            self.up0 = UpBlock3D(in_ch=chs[1],       out_ch=chs[0], use_att=use_att, skip_ch=chs[0])
+            dec_out = chs[0]
+        elif depth == 4:
+            self.up2 = UpBlock3D(in_ch=bott_in * 2, out_ch=chs[2], use_att=use_att, skip_ch=chs[2])
+            self.up1 = UpBlock3D(in_ch=chs[2],       out_ch=chs[1], use_att=use_att, skip_ch=chs[1])
+            self.up0 = UpBlock3D(in_ch=chs[1],       out_ch=chs[0], use_att=use_att, skip_ch=chs[0])
+            dec_out = chs[0]
+        else:  # depth == 3
+            self.up1 = UpBlock3D(in_ch=bott_in * 2, out_ch=chs[1], use_att=use_att, skip_ch=chs[1])
+            self.up0 = UpBlock3D(in_ch=chs[1],       out_ch=chs[0], use_att=use_att, skip_ch=chs[0])
+            dec_out = chs[0]
+
+
+        self.head = nn.Conv3d(dec_out, num_classes, kernel_size=1)
+
+        self.depth = depth
 
     def forward(self, x):
-        x0 = self.in_conv(x)
-        x1 = self.d1(x0)
-        x2 = self.d2(x1)
-        x3 = self.d3(x2)
-        xb = self.bn(x3)
+        # Encoder
+        e0 = self.enc0(x)
+        x = self.down0(e0)
 
-        y3 = self.u3(xb, x3)
-        y2 = self.u2(y3, x2)
-        y1 = self.u1(y2, x1)
-        y0 = self.u0(y1, x0)
+        e1 = self.enc1(x)
+        if self.depth >= 4:
+            x = self.down1(e1)
+            e2 = self.enc2(x)
 
-        logits0 = self.out0(y0)
-        if not self.ds:
-            return logits0
+        if self.depth == 5:
+            x = self.down2(e2)
+            e3 = self.enc3(x)
+            x = self.down3(e3)
+            # Bottleneck
+            x = self.bott(x)
+            # Decoder
+            x = self.up3(x, e3)
+            x = self.up2(x, e2)
+            x = self.up1(x, e1)
+            x = self.up0(x, e0)
+        elif self.depth == 4:
+            x = self.down2(e2)
+            x = self.bott(x)
+            x = self.up2(x, e2)
+            x = self.up1(x, e1)
+            x = self.up0(x, e0)
+        else:  # depth == 3
+            x = self.down1(e1)
+            x = self.bott(x)
+            x = self.up1(x, e1)
+            x = self.up0(x, e0)
 
-        # deep supervision: upsample aux heads to full res
-        logits1 = F.interpolate(self.out1(y1), size=logits0.shape[-3:], mode='trilinear', align_corners=False)
-        logits2 = F.interpolate(self.out2(y2), size=logits0.shape[-3:], mode='trilinear', align_corners=False)
-        logits3 = F.interpolate(self.out3(y3), size=logits0.shape[-3:], mode='trilinear', align_corners=False)
-        return [logits0, logits1, logits2, logits3]
+        logits = self.head(x)
+        return logits

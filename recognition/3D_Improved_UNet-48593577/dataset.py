@@ -1,4 +1,5 @@
 import os
+import socket
 import re
 import random
 from typing import List, Tuple, Dict, Optional
@@ -7,12 +8,22 @@ import nibabel as nib
 import torch
 from torch.utils.data import Dataset
 
-# -----------------------------
-# Paths (adjust root if needed)
-# -----------------------------
-DATA_ROOT = os.path.join(os.path.dirname(__file__), "Prostate3D_data")
-IMAGES_DIR = os.path.join(DATA_ROOT, "semantic_MRs_anon")
-LABELS_DIR = os.path.join(DATA_ROOT, "semantic_labels_anon")
+# -----------------------------------------------------
+# Detect Environment and Set Dataset Paths
+# -----------------------------------------------------
+hostname = socket.gethostname()
+
+if "rangpur" in hostname.lower():
+    # UQ Rangpur cluster paths
+    DATA_ROOT = "/home/groups/comp3710/HipMRI_Study_open"
+    IMAGES_DIR = os.path.join(DATA_ROOT, "semantic_MRs")
+    LABELS_DIR = os.path.join(DATA_ROOT, "semantic_labels_only")
+else:
+    # Local folder layout
+    ROOT_DIR = os.path.dirname(__file__)
+    DATA_ROOT = os.path.join(ROOT_DIR, "Prostate3D_data")
+    IMAGES_DIR = os.path.join(DATA_ROOT, "semantic_MRs_anon")
+    LABELS_DIR = os.path.join(DATA_ROOT, "semantic_labels_anon")
 
 # -----------------------------
 # Filename parsing
