@@ -1,9 +1,7 @@
 # Prostate 3D Segmentation with Improved 3D U-Net (Hard Difficulty)
 
-## 1 – Problem & Goal
-Segment the prostate gland from volumetric MRI scans in the **Prostate 3D** dataset.  
-Each volume (`semantic_MRs_anon`) has a corresponding manual segmentation label (`semantic_labels_anon`).  
-The objective is to train a **3D Improved U-Net** that achieves a **Dice Similarity Coefficient ≥ 0.70** on the held-out test set.
+## 1 – Description
+This project implements a 3D Improved U-Net model to perform automatic segmentation of the prostate and surrounding organs from downsampled MRI scans. The goal is to achieve a minimum Dice Similarity Coefficient (DSC) of 0.70 on the held-out test set across all labels. The dataset, derived from the HipMRI study, contains 211 3D MRI volumes collected from 38 patients. Each scan is paired with a corresponding segmentation label, categorising voxels into six classes: background, body contour, bone, bladder, rectum, and prostate region. This segmentation task supports prostate cancer analysis, treatment planning, and medical image understanding by localising key anatomical structures within volumetric data.
 
 ---
 
@@ -12,9 +10,6 @@ The objective is to train a **3D Improved U-Net** that achieves a **Dice Similar
 Prostate3D_data/
 ├── semantic_MRs_anon/ # MRI volumes (inputs)
 └── semantic_labels_anon/ # segmentation masks (labels)
-
-yaml
-Copy code
 
 **Preprocessing**
 - Files are matched by prefix (`Case_XXX_WeekY`).
@@ -26,12 +21,11 @@ Copy code
 
 ---
 
-## 3 – Method (How It Works)
+## 3 – Method
+The model builds upon the classic 3D U-Net encoder–decoder architecture by integrating Attention Gates, allowing it to suppress irrelevant background features and focus on organ-specific regions during feature fusion. MRI intensities are first preprocessed through percentile clipping and z-score normalisation before being cropped into 3D patches for efficient training. The network is trained using a hybrid loss function combining Dice and Focal losses to handle severe class imbalance. Performance is evaluated using the mean Dice coefficient across all six anatomical labels, ensuring accurate segmentation even for smaller regions such as the prostate and rectum.
+
 ### Architecture
-- **Base:** 3D U-Net encoder–decoder with skip connections.  
-- **Improvement:** Attention Gates (CAN3D-style) filter skip-features before fusion.  
-- **Loss:** Hybrid Dice + Focal loss for class imbalance.  
-- **Metric:** Dice Similarity Coefficient (mean across test set).
+![alt text](image.png)
 
 ### Training Setup
 | Component | Setting |
