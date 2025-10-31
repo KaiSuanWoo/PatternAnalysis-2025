@@ -182,6 +182,16 @@ Mean Dice (overall): 0.9112
   Prostate   : 0.8237
 Saved outputs to: results/20251031-003405_D4_B32_[96,192,192]_eval/
 ```
+**Dependencies**
+-Python 3.10
+-PyTorch ≥ 2.2
+-Torchvision
+-Nibabel (for MRI handling)
+-NumPy, Pandas
+-Matplotlib, TQDM
+Random seeds (seed = 1337) are fixed to ensure reproducibility across runs.
+
+Training and evaluation were performed on the UQ Rangpur High-Performance Computing (HPC) cluster, using an NVIDIA A100 GPU (40 GB VRAM) under CUDA 12.1.
 
 ---
 
