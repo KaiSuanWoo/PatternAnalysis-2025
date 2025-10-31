@@ -80,11 +80,11 @@ Early stopping is applied when validation Dice fails to improve over 15 epochs.
 
 ### Training and Validation Curves
 **Training and Validation Loss**
-![train val loss](/results/20251030-025603_D4_B32_[96,192,192]_eval/loss_vs_epoch.png)
+![train val loss](loss_vs_epoch.png)
 Loss curves showing convergence of Dice–Focal loss during 100 training epochs. The steady gap between training and validation losses indicates good generalisation.
 
 **Training and Validation Dice Coefficient**
-![alt text](/results/20251030-025603_D4_B32_[96,%20192,%20192]_eval/train_val_dice_vs_epoch.png)
+![alt text](train_val_dice_vs_epoch.png)
 Dice curves showing progressive improvement in segmentation accuracy, plateauing near a mean Dice of 0.73 on validation data.
 
 During training, the model initially learns to segment large anatomical regions such as the body and bladder before refining its predictions for smaller regions like the prostate and rectum.
@@ -117,14 +117,14 @@ These results confirm that the Improved 3D U-Net achieves strong generalisation 
 
 ### Qualitative Evaluation
 **Example Segmentation Output**
-![alt text](/results/20251030-025603_D4_B32_[96,192,192]_eval/case_000_triplet_z48.png)
-![alt text](/results/20251030-025603_D4_B32_[96,192,192]_eval/case_004_triplet_z48.png)
-![alt text](/results/20251030-025603_D4_B32_[96,192,192]_eval/case_008_triplet_z48.png)
+![alt text](case_000_triplet_z48.png)
+![alt text](case_004_triplet_z48.png)
+![alt text](case_008_triplet_z48.png)
 Predicted segmentation overlays on MRI slices. The model accurately delineates prostate and bladder regions, while minor boundary mismatches appear in the rectum area.
 
 **Per-Class Dice Scores**
-![alt text](/results/20251030-025603_D4_B32_[96,192,192]_eval/dice_loss_over_cases.png)
-![alt text](/results/20251030-025603_D4_B32_[96,192,192]_eval/test_per_class_dice.png) 
+![alt text](dice_loss_over_cases.png)
+![alt text](test_per_class_dice.png) 
 Class-wise Dice coefficients showing higher accuracy for large organs (body, bladder) and slightly lower performance for smaller structures (rectum, prostate).
 
 ---
